@@ -2005,6 +2005,9 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
+_DIGEST_KEEP_RE = re.compile(r"(?im)\[SKILL_PRUNED[^\]]*\]|^.*\b(?:error|traceback|exception|failed)\b.*$")
+
+
 class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngine):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
@@ -2730,8 +2733,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, summary_tool_results: str = "full",
     ):
+        self.summary_tool_results = summary_tool_results if summary_tool_results in ("full", "digest") else "full"
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
@@ -3402,8 +3406,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Redact the FULL args before cutting: delimited secrets (PEM BEGIN…END) only match whole, so a
         # pre-redaction cut would leave a key body straddling the cut unredacted in the persisted summary.
         args = _redact_compaction_text(fn.get("arguments", ""))
-        if len(args) > self._TOOL_ARGS_MAX:
-            args = args[:self._TOOL_ARGS_HEAD] + "..."
+        limit, head = (200, 200) if getattr(self, "summary_tool_results", "full") == "digest" else (self._TOOL_ARGS_MAX, self._TOOL_ARGS_HEAD)
+        if len(args) > limit:
+            args = args[:head] + "..."
         return f"  {fn.get('name', '?')}({args})"
 
     def _serialize_records_for_summary(self, turns: List[Dict[str, Any]]) -> List[str]:
@@ -3424,6 +3429,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             if len(content) > self._CONTENT_MAX:
                 content = elide_middle(content, self._CONTENT_HEAD, self._CONTENT_TAIL)
             if role == "tool":
+                if self.summary_tool_results == "digest":
+                    hits = list(dict.fromkeys(m.group(0).strip()[:200] for m in _DIGEST_KEEP_RE.finditer(content)))[:3]
+                    if hits:
+                        parts.append(f"[TOOL RESULT {msg.get('tool_call_id', '')}]: (body omitted) " + " | ".join(hits))
+                    continue
                 parts.append(f"[TOOL RESULT {msg.get('tool_call_id', '')}]: {content}")
                 continue
             if role == "assistant" and msg.get("tool_calls", []):
