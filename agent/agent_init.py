@@ -1596,6 +1596,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
+        # "digest" drops tool-result bodies from the summarizer input (keeps error/SKILL_PRUNED lines);
+        # small local summarizers copy raw tool output verbatim until the token cap otherwise.
+        tool_results=str(cfg.get("tool_results", "full")).strip().lower(),
     )
 
 
@@ -2011,7 +2014,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
-            custom_providers=_custom_providers,
+            custom_providers=_custom_providers, summary_tool_results=cs.tool_results,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
