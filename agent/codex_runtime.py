@@ -13,7 +13,7 @@ import threading
 import time
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
@@ -931,6 +931,12 @@ class _CodexResponseAssembler:
         if isinstance(refusal_text, str) and refusal_text:
             self.text_deltas.append(refusal_text)
 
+    def _pending_by_output_index(self, output_index: Any) -> Optional[dict[str, Any]]:
+        if output_index is None:
+            return None
+        matches = [p for p in self.pending_function_calls.values() if p.get("output_index") == output_index]
+        return matches[0] if len(matches) == 1 else None
+
     def _pending_function_key(self, item_id: str, output_index: Any) -> str | None:
         if item_id in self.pending_function_calls:
             return item_id
@@ -941,11 +947,15 @@ class _CodexResponseAssembler:
                          if pending["output_index"] == output_index), None)
         return None
 
+
     def _on_function_call(self, event: Any, event_type: str) -> None:
         self.has_tool_calls = True
         key = self._pending_function_key(str(_event_field(event, "item_id", "")),
                                          _event_field(event, "output_index"))
         pending = self.pending_function_calls.get(key)
+        if pending is None:
+            # Some proxies (GitHub Copilot) rotate the opaque item id on every event; fall back to output_index.
+            pending = self._pending_by_output_index(_event_field(event, "output_index", None))
         if pending is None:
             return  # the item itself lands on output_item.done
         if "delta" in event_type:
@@ -1009,6 +1019,22 @@ class _CodexResponseAssembler:
         # The done payload is authoritative for every pending alias of this call.
         for pending_key in pending_keys:
             self.pending_function_calls.pop(pending_key, None)
+        # LOCAL PATCH (aibox 2026-10-18): the call_id/index alias settle above misses calls whose
+        # .added carried no call_id and whose item id rotated before .done. Sweep any remaining
+        # pending entry matching this done item by call_id, then unambiguously by output_index,
+        # so stale entries never linger as empty-argument twins.
+        _done_call_id = _event_field(done_item, "call_id", None)
+        if _done_call_id:
+            for key, pend in list(self.pending_function_calls.items()):
+                if _event_field(pend["item"], "call_id", None) == _done_call_id:
+                    del self.pending_function_calls[key]
+        else:
+            _pend = self._pending_by_output_index(_event_field(event, "output_index", announced_index))
+            if _pend is not None:
+                for key, val in list(self.pending_function_calls.items()):
+                    if val is _pend:
+                        del self.pending_function_calls[key]
+                        break
         if _message_phase(done_item) == "commentary" and self.on_commentary_message is not None:
             commentary_text = "".join(self.commentary_text_deltas).strip() or _output_text_of(done_item)
             if commentary_text:
